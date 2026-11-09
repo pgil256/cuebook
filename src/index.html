@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'; media-src 'self' blob:">
+  <title>Cuebook</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body class="mode-edit">
+  <div id="home" class="screen hidden"></div>
+
+  <div id="showScreen" class="screen hidden">
+    <header id="topbar"></header>
+    <section id="transport"></section>
+    <main id="workspace">
+      <section id="scriptPane" class="pane"></section>
+      <div id="splitV" class="splitter-v" title="Drag to resize"></div>
+      <section id="cuePane" class="pane">
+        <div id="cueListPane"></div>
+        <div id="splitH" class="splitter-h edit-only" title="Drag to resize"></div>
+        <div id="inspector" class="edit-only"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toasts"></div>
+  <div id="modalRoot"></div>
+</body>
+</html>

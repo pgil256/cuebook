@@ -1,0 +1,44 @@
+{
+  "name": "cuebook",
+  "productName": "Cuebook",
+  "version": "0.1.0",
+  "description": "Sound cue playback for theater: script on the left, cue list on the right, one big GO button.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "build": {
+    "appId": "app.cuebook.desktop",
+    "productName": "Cuebook",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "!**/*.map"
+    ],
+    "fileAssociations": [
+      {
+        "ext": "cuebook",
+        "name": "Cuebook show",
+        "description": "Cuebook show file"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    }
+  },
+  "dependencies": {
+    "mammoth": "^1.13.0",
+    "pdfjs-dist": "^6.5.438"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
+    "playwright-core": "^1.65.0"
+  }
+}
