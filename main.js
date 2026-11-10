@@ -1,19 +1,20 @@
 // Cuebook — Electron main process.
-// Owns everything that touches the disk: show folders, media import, script
-// conversion, the app:// protocol that serves UI files and show media, plus
-// window-level safety (single instance, close guard, sleep blocking, crash recovery).
+// Show folders on disk, copying music and scripts into them, Word conversion,
+// and the app:// protocol that serves the UI and show files (with byte ranges,
+// so the player can jump anywhere in a song).
 
-const { app, BrowserWindow, ipcMain, dialog, protocol, Menu, powerSaveBlocker, shell, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, Menu, powerSaveBlocker, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const crypto = require('crypto');
+const { Readable } = require('stream');
 
 const APP_DIR = __dirname;
 const SHOW_FILE = 'show.cuebook';
 const AUDIO_DIR = 'audio';
 const SCRIPT_DIR = 'script';
-const AUDIO_EXT = ['.mp3', '.wav', '.wave', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.flac', '.aif', '.aiff', '.webm'];
+const AUDIO_EXT = ['.mp3', '.wav', '.wave', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.flac', '.webm'];
 const SCRIPT_EXT = { '.pdf': 'pdf', '.docx': 'docx', '.txt': 'txt', '.text': 'txt', '.md': 'txt', '.fountain': 'txt' };
 
 const MIME = {
@@ -24,7 +25,6 @@ const MIME = {
   '.json': 'application/json',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
-  '.ico': 'image/x-icon',
   '.wasm': 'application/wasm',
   '.bcmap': 'application/octet-stream',
   '.pfb': 'application/octet-stream',
@@ -41,29 +41,26 @@ const MIME = {
   '.oga': 'audio/ogg',
   '.opus': 'audio/ogg',
   '.flac': 'audio/flac',
-  '.aif': 'audio/aiff',
-  '.aiff': 'audio/aiff',
   '.webm': 'audio/webm',
 };
 
-// Only these parts of the app folder are served to the renderer.
+// Only these parts of the app folder are served to the window.
 const SERVED_APP_PATHS = ['src/', 'node_modules/pdfjs-dist/build/', 'node_modules/pdfjs-dist/cmaps/',
   'node_modules/pdfjs-dist/standard_fonts/', 'node_modules/pdfjs-dist/wasm/', 'node_modules/pdfjs-dist/iccs/'];
-
-let win = null;
-let currentShowDir = null;
-let powerBlockerId = null;
-let allowClose = false;
-let closeTimer = null;
-// Kept in memory so a crashed renderer can be reloaded straight back into the show.
-let recovery = { showDir: null, standbyId: null, mode: null };
 
 // Automated tests run with their own profile so they never touch the real recent-shows list.
 const TEST_MODE = !!process.env.CUEBOOK_TEST;
 if (process.env.CUEBOOK_USER_DATA) app.setPath('userData', process.env.CUEBOOK_USER_DATA);
 
+let win = null;
+let currentShowDir = null;
+let awakeId = null;
+let allowClose = false;
+let closeTimer = null;
+let pendingOpen = null; // show to open when the window (re)loads: after a crash, or a .cuebook file passed in
+
 if (!TEST_MODE && !app.requestSingleInstanceLock()) {
-  // A second copy of the app could double-fire audio. Focus the first one instead.
+  // Two copies could play over each other. Focus the first one instead.
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -81,9 +78,7 @@ protocol.registerSchemesAsPrivileged([
 function safeJoin(root, rel) {
   const full = path.resolve(root, rel);
   const rootResolved = path.resolve(root);
-  if (full !== rootResolved && !full.startsWith(rootResolved + path.sep)) {
-    throw new Error('Path escapes its folder: ' + rel);
-  }
+  if (full !== rootResolved && !full.startsWith(rootResolved + path.sep)) throw new Error('Path escapes its folder: ' + rel);
   return full;
 }
 
@@ -92,13 +87,13 @@ function requireShow() {
   return currentShowDir;
 }
 
-function toPosix(p) { return p.split(path.sep).join('/'); }
+const toPosix = (p) => p.split(path.sep).join('/');
 
 async function exists(p) {
   try { await fsp.access(p); return true; } catch { return false; }
 }
 
-async function hashFile(p) {
+function hashFile(p) {
   return new Promise((resolve, reject) => {
     const h = crypto.createHash('sha1');
     fs.createReadStream(p).on('data', (d) => h.update(d)).on('end', () => resolve(h.digest('hex'))).on('error', reject);
@@ -106,17 +101,15 @@ async function hashFile(p) {
 }
 
 /**
- * Copy `src` into `<show>/<subdir>/`. If a file with the same name already
- * exists and is byte-identical it is reused; otherwise a numbered name is used.
- * Returns the show-relative POSIX path.
+ * Copy `src` into `<show>/<subdir>/`. An identical file already there is reused;
+ * a different file with the same name gets a numbered name. Returns the show-relative path.
  */
 async function copyIntoShow(src, subdir) {
   const showDir = requireShow();
   const destDir = path.join(showDir, subdir);
   await fsp.mkdir(destDir, { recursive: true });
-  // Already inside this show's folder? Use it where it is.
   const rel = path.relative(showDir, src);
-  if (!rel.startsWith('..') && !path.isAbsolute(rel)) return toPosix(rel);
+  if (!rel.startsWith('..') && !path.isAbsolute(rel)) return toPosix(rel); // already in this show
 
   const ext = path.extname(src);
   const base = path.basename(src, ext);
@@ -138,12 +131,12 @@ async function copyIntoShow(src, subdir) {
   throw new Error('Could not find a free file name for ' + src);
 }
 
-/** Write atomically: temp file + rename, keeping the previous version as .bak. */
+/** Write via a temp file + rename, keeping the previous version as .bak. */
 async function atomicWrite(file, text) {
   const tmp = file + '.tmp';
   await fsp.writeFile(tmp, text, 'utf8');
   if (await exists(file)) {
-    try { await fsp.copyFile(file, file + '.bak'); } catch { /* backup is best effort */ }
+    try { await fsp.copyFile(file, file + '.bak'); } catch { /* best effort */ }
   }
   await fsp.rename(tmp, file);
 }
@@ -170,27 +163,7 @@ async function addRecent(dir, name) {
 
 function newShowJson(name) {
   const now = new Date().toISOString();
-  return {
-    format: 'cuebook-show',
-    version: 1,
-    name,
-    createdAt: now,
-    modifiedAt: now,
-    script: null,
-    settings: {
-      outputDeviceId: '',
-      outputDeviceLabel: '',
-      masterDb: 0,
-      defaultStopFade: 2,
-      goGuardMs: 500,
-      panicFade: 1,
-      mode: 'edit',
-      followScript: true,
-      darkScript: false,
-      scriptZoom: 1,
-    },
-    cues: [],
-  };
+  return { format: 'cuebook-show', version: 2, name, createdAt: now, modifiedAt: now, script: null, volume: 1, tracks: [] };
 }
 
 async function loadShowFromDir(dir) {
@@ -205,18 +178,14 @@ async function loadShowFromDir(dir) {
   try {
     show = JSON.parse(text);
   } catch (err) {
-    // Fall back to the last good copy rather than refusing to open on show night.
+    // Fall back to the last good copy rather than refusing to open.
     const bak = file + '.bak';
-    if (await exists(bak)) {
-      show = JSON.parse(await fsp.readFile(bak, 'utf8'));
-      show.__restoredFromBackup = true;
-    } else {
-      throw new Error('The show file is damaged and there is no backup: ' + err.message);
-    }
+    if (!(await exists(bak))) throw new Error('The show file is damaged and there is no backup: ' + err.message);
+    show = JSON.parse(await fsp.readFile(bak, 'utf8'));
+    show.__restoredFromBackup = true;
   }
   if (show.format !== 'cuebook-show') throw new Error('That file is not a Cuebook show.');
   currentShowDir = dir;
-  recovery = { showDir: dir, standbyId: null, mode: null };
   await addRecent(dir, show.name);
   return { dir, show };
 }
@@ -249,7 +218,7 @@ function registerIpc() {
 
   handle('shows:pickFolder', async (defaultPath) => {
     const r = await dialog.showOpenDialog(win, {
-      title: 'Choose where to create the show folder',
+      title: 'Choose where to save the show',
       defaultPath,
       properties: ['openDirectory', 'createDirectory'],
     });
@@ -280,21 +249,15 @@ function registerIpc() {
   handle('shows:open', async (p) => {
     let dir = p;
     try {
-      const st = await fsp.stat(p);
-      if (st.isFile()) dir = path.dirname(p);
-    } catch { /* let loadShowFromDir report it */ }
+      if ((await fsp.stat(p)).isFile()) dir = path.dirname(p);
+    } catch { /* loadShowFromDir reports it */ }
     return loadShowFromDir(dir);
   });
 
-  handle('shows:close', async () => {
-    currentShowDir = null;
-    recovery = { showDir: null, standbyId: null, mode: null };
-    return true;
-  });
+  handle('shows:close', async () => { currentShowDir = null; return true; });
 
   handle('show:save', async (json) => {
-    const dir = requireShow();
-    await atomicWrite(path.join(dir, SHOW_FILE), json);
+    await atomicWrite(path.join(requireShow(), SHOW_FILE), json);
     return true;
   });
 
@@ -309,7 +272,7 @@ function registerIpc() {
 
   handle('media:pickAudio', async () => {
     const r = await dialog.showOpenDialog(win, {
-      title: 'Add sound files',
+      title: 'Add music',
       filters: [{ name: 'Audio', extensions: AUDIO_EXT.map((e) => e.slice(1)) }],
       properties: ['openFile', 'multiSelections'],
     });
@@ -319,14 +282,12 @@ function registerIpc() {
   handle('media:import', async (paths) => {
     const results = [];
     for (const p of paths) {
-      const ext = path.extname(p).toLowerCase();
-      if (!AUDIO_EXT.includes(ext)) {
+      if (!AUDIO_EXT.includes(path.extname(p).toLowerCase())) {
         results.push({ source: p, error: `${path.basename(p)} isn't a supported audio file` });
         continue;
       }
       try {
-        const rel = await copyIntoShow(p, AUDIO_DIR);
-        results.push({ source: p, file: rel, name: path.basename(p, path.extname(p)) });
+        results.push({ source: p, file: await copyIntoShow(p, AUDIO_DIR), name: path.basename(p, path.extname(p)) });
       } catch (err) {
         results.push({ source: p, error: err.message });
       }
@@ -336,7 +297,7 @@ function registerIpc() {
 
   handle('script:pick', async () => {
     const r = await dialog.showOpenDialog(win, {
-      title: 'Import a script',
+      title: 'Add a script',
       filters: [{ name: 'Scripts', extensions: ['pdf', 'docx', 'txt', 'text', 'md', 'fountain'] }],
       properties: ['openFile'],
     });
@@ -346,56 +307,43 @@ function registerIpc() {
   handle('script:import', async (src) => {
     const type = SCRIPT_EXT[path.extname(src).toLowerCase()];
     if (!type) throw new Error('Scripts must be PDF, Word (.docx) or plain text.');
-    const file = await copyIntoShow(src, SCRIPT_DIR);
-    return { file, type, name: path.basename(src) };
-  });
-
-  handle('script:saveText', async (text) => {
-    const dir = requireShow();
-    await fsp.mkdir(path.join(dir, SCRIPT_DIR), { recursive: true });
-    let name = 'pasted script.txt';
-    for (let i = 2; await exists(path.join(dir, SCRIPT_DIR, name)); i++) name = `pasted script (${i}).txt`;
-    await fsp.writeFile(path.join(dir, SCRIPT_DIR, name), text, 'utf8');
-    return { file: `${SCRIPT_DIR}/${name}`, type: 'txt', name };
+    return { file: await copyIntoShow(src, SCRIPT_DIR), type, name: path.basename(src) };
   });
 
   handle('script:readText', async (rel) => fsp.readFile(safeJoin(requireShow(), rel), 'utf8'));
 
   handle('script:docxToHtml', async (rel) => {
     const mammoth = require('mammoth');
-    const result = await mammoth.convertToHtml({ path: safeJoin(requireShow(), rel) });
-    return result.value;
+    return (await mammoth.convertToHtml({ path: safeJoin(requireShow(), rel) })).value;
   });
 
-  handle('shell:reveal', async (rel) => {
-    shell.showItemInFolder(rel ? safeJoin(requireShow(), rel) : path.join(requireShow(), SHOW_FILE));
+  handle('shell:reveal', async () => {
+    shell.showItemInFolder(path.join(requireShow(), SHOW_FILE));
     return true;
   });
 
-  handle('app:setShowMode', async (on) => {
-    // Keep the screen (and machine) awake while in Show mode.
-    if (on && powerBlockerId === null) powerBlockerId = powerSaveBlocker.start('prevent-display-sleep');
-    if (!on && powerBlockerId !== null) { powerSaveBlocker.stop(powerBlockerId); powerBlockerId = null; }
-    recovery.mode = on ? 'show' : 'edit';
+  // Keep the screen awake while music is playing.
+  handle('app:keepAwake', async (on) => {
+    if (on && awakeId === null) awakeId = powerSaveBlocker.start('prevent-display-sleep');
+    if (!on && awakeId !== null) { powerSaveBlocker.stop(awakeId); awakeId = null; }
     return true;
   });
 
-  handle('app:setStandby', async (id) => { recovery.standbyId = id; return true; });
-  handle('app:getRecovery', async () => {
-    const r = global.__pendingRecovery || null;
-    global.__pendingRecovery = null;
-    return r;
+  handle('app:takePendingOpen', async () => {
+    const p = pendingOpen;
+    pendingOpen = null;
+    return p;
   });
 
   handle('app:setTitle', async (t) => { if (win) win.setTitle(t); return true; });
 
-  // Renderer answers the close request: ok to close, or ask the operator first.
+  // The window answers a close request: close now, or ask first.
   handle('app:closeReply', async ({ needsConfirm, reason }) => {
     if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
     if (needsConfirm) {
       const r = await dialog.showMessageBox(win, {
         type: 'warning',
-        buttons: ['Keep running', 'Quit Cuebook'],
+        buttons: ['Keep playing', 'Quit Cuebook'],
         defaultId: 0,
         cancelId: 0,
         title: 'Quit Cuebook?',
@@ -411,21 +359,55 @@ function registerIpc() {
 
 // ---------- protocol ----------
 
+/** Serve a file, honouring a `Range: bytes=` header so audio can seek. */
+async function serveFile(full, range, stream) {
+  const stat = await fsp.stat(full);
+  if (!stat.isFile()) throw new Error('Not a file');
+  const size = stat.size;
+  const headers = {
+    'content-type': MIME[path.extname(full).toLowerCase()] || 'application/octet-stream',
+    'cache-control': 'no-store',
+    'accept-ranges': 'bytes',
+  };
+  let start = 0;
+  let end = size - 1;
+  let status = 200;
+  const m = range && /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+  if (m && (m[1] !== '' || m[2] !== '')) {
+    if (m[1] === '') start = Math.max(0, size - Number(m[2]));
+    else {
+      start = Number(m[1]);
+      if (m[2] !== '') end = Math.min(Number(m[2]), size - 1);
+    }
+    if (start >= size || start > end) {
+      return new Response(null, { status: 416, headers: { 'content-range': `bytes */${size}` } });
+    }
+    status = 206;
+    headers['content-range'] = `bytes ${start}-${end}/${size}`;
+  }
+  if (size === 0) return new Response(null, { status: 200, headers: { ...headers, 'content-length': '0' } });
+  headers['content-length'] = String(end - start + 1);
+  let body;
+  if (stream) {
+    body = Readable.toWeb(fs.createReadStream(full, { start, end }));
+  } else {
+    const data = await fsp.readFile(full); // app files are small (and may live inside the asar archive)
+    body = status === 206 ? data.subarray(start, end + 1) : data;
+  }
+  return new Response(body, { status, headers });
+}
+
 function registerProtocol() {
   protocol.handle('app', async (request) => {
     try {
       const url = new URL(request.url);
       const pathname = decodeURIComponent(url.pathname).replace(/^\/+/, '');
-      let full;
+      const range = request.headers.get('range');
       if (pathname.startsWith('show/')) {
-        full = safeJoin(requireShow(), pathname.slice('show/'.length));
-      } else {
-        if (!SERVED_APP_PATHS.some((p) => pathname.startsWith(p))) return new Response('Not found', { status: 404 });
-        full = safeJoin(APP_DIR, pathname);
+        return await serveFile(safeJoin(requireShow(), pathname.slice('show/'.length)), range, true);
       }
-      const data = await fsp.readFile(full);
-      const type = MIME[path.extname(full).toLowerCase()] || 'application/octet-stream';
-      return new Response(data, { status: 200, headers: { 'content-type': type, 'cache-control': 'no-store' } });
+      if (!SERVED_APP_PATHS.some((p) => pathname.startsWith(p))) return new Response('Not found', { status: 404 });
+      return await serveFile(safeJoin(APP_DIR, pathname), range, false);
     } catch (err) {
       return new Response(String(err.message || err), { status: 404 });
     }
@@ -435,7 +417,6 @@ function registerProtocol() {
 // ---------- window ----------
 
 function buildMenu() {
-  const isDev = !app.isPackaged;
   const template = [
     {
       label: 'File',
@@ -446,11 +427,9 @@ function buildMenu() {
         { role: 'quit', label: 'Quit Cuebook' },
       ],
     },
-    // The Edit menu keeps Ctrl+C / Ctrl+V / Ctrl+A working in text fields.
-    // Undo/redo are left to the renderer so they can act on the cue list.
     { label: 'Edit', submenu: [{ role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
     {
-      // No Reload entry on purpose: reloading mid-show would cut all audio.
+      // No Reload entry on purpose: reloading would cut the music.
       label: 'View',
       submenu: [
         { role: 'togglefullscreen' },
@@ -458,23 +437,20 @@ function buildMenu() {
         { role: 'resetZoom' },
         { role: 'zoomIn' },
         { role: 'zoomOut' },
-        ...(isDev ? [{ type: 'separator' }, { role: 'toggleDevTools' }] : []),
+        ...(!app.isPackaged ? [{ type: 'separator' }, { role: 'toggleDevTools' }] : []),
       ],
     },
-    {
-      label: 'Help',
-      submenu: [{ label: 'Keyboard shortcuts', click: () => win && win.webContents.send('menu', 'shortcuts') }],
-    },
+    { label: 'Help', submenu: [{ label: 'Keyboard shortcuts', click: () => win && win.webContents.send('menu', 'shortcuts') }] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1000,
-    minHeight: 640,
+    width: 1400,
+    height: 880,
+    minWidth: 900,
+    minHeight: 560,
     backgroundColor: '#0f1216',
     title: 'Cuebook',
     show: false,
@@ -483,7 +459,6 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Never slow down timers/audio scheduling when the window is in the background.
       backgroundThrottling: false,
       autoplayPolicy: 'no-user-gesture-required',
       spellcheck: false,
@@ -497,17 +472,16 @@ function createWindow() {
   });
   win.loadURL('app://local/src/index.html');
 
-  // Block navigation away from the app (e.g. a file dropped outside a drop zone).
+  // Never navigate away from the app (e.g. a file dropped outside a drop area).
   win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith('app://local/src/')) e.preventDefault(); });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   win.on('close', (e) => {
     if (allowClose) return;
     e.preventDefault();
-    if (closeTimer) return; // already asked
-    // Ask the renderer to flush its save and tell us whether a confirm is needed.
+    if (closeTimer) return;
     win.webContents.send('app:beforeClose');
-    // Safety net: if the renderer never answers (hung), close anyway.
+    // If the window never answers (hung), close anyway.
     closeTimer = setTimeout(() => {
       closeTimer = null;
       allowClose = true;
@@ -517,8 +491,8 @@ function createWindow() {
 
   win.webContents.on('render-process-gone', (_e, details) => {
     if (details.reason === 'clean-exit') return;
-    // Reload straight back into the open show with the same next cue.
-    global.__pendingRecovery = recovery.showDir ? { ...recovery, reason: details.reason } : null;
+    // Reload straight back into the open show.
+    pendingOpen = currentShowDir ? { dir: currentShowDir, reason: 'crash' } : null;
     setTimeout(() => { if (win && !win.isDestroyed()) win.loadURL('app://local/src/index.html'); }, 300);
   });
 
@@ -526,18 +500,13 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  // Allow listing audio output devices with their names (needed for the output picker).
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => ['media', 'speaker-selection'].includes(permission));
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => cb(['media', 'speaker-selection'].includes(permission)));
-
   registerProtocol();
   registerIpc();
   buildMenu();
   createWindow();
-
   // Opening a .cuebook file directly (double-click / command line).
   const fileArg = process.argv.find((a) => a.toLowerCase().endsWith('.cuebook'));
-  if (fileArg) global.__pendingRecovery = { showDir: path.dirname(path.resolve(fileArg)), standbyId: null, mode: null, reason: 'open-file' };
+  if (fileArg) pendingOpen = { dir: path.dirname(path.resolve(fileArg)), reason: 'file' };
 });
 
 app.on('window-all-closed', () => app.quit());

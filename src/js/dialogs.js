@@ -1,56 +1,40 @@
-// Modal dialogs and toast notifications.
+// Confirmation dialogs and toast messages.
 
 import { h } from './util.js';
 import { icon } from './icons.js';
 
-let openModal = null;
+let finishOpen = null;
 
-export function isModalOpen() { return !!openModal; }
+export const isModalOpen = () => !!finishOpen;
+export function closeModal(value = null) { if (finishOpen) finishOpen(value); }
 
-/**
- * Show a modal. `buttons`: [{ label, value, primary, danger }].
- * Resolves with the clicked button's value (or null when dismissed).
- * `onSubmit` (optional) can validate/transform before closing; return undefined to keep it open.
- */
-export function modal({ title, body, buttons = [{ label: 'OK', value: true, primary: true }], wide = false, onSubmit = null, initialFocus = null }) {
+/** buttons: [{ label, value, primary, danger }]. Resolves with the clicked value, or null if dismissed. */
+export function modal({ title, body, buttons, focusCancel = false }) {
   closeModal(null);
   return new Promise((resolve) => {
     const root = document.getElementById('modalRoot');
     const finish = (value) => {
-      if (!openModal || openModal.finish !== finish) return;
-      openModal = null;
+      if (finishOpen !== finish) return;
+      finishOpen = null;
       root.innerHTML = '';
-      root.classList.remove('open');
       resolve(value);
     };
-    const btnRow = h('div', { class: 'modal-buttons' }, ...buttons.map((b) => h('button', {
+    const btns = buttons.map((b) => h('button', {
+      type: 'button',
       class: `btn ${b.primary ? 'primary' : ''} ${b.danger ? 'danger' : ''}`,
-      type: b.primary ? 'submit' : 'button',
-      onclick: async (e) => {
-        e.preventDefault();
-        if (b.primary && onSubmit) {
-          const v = await onSubmit();
-          if (v === undefined) return;
-          finish(v);
-        } else finish(b.value);
-      },
-    }, b.label)));
-    const form = h('form', { class: `modal ${wide ? 'wide' : ''}`, onsubmit: (e) => e.preventDefault() },
-      h('div', { class: 'modal-head' }, h('h2', { text: title }), h('button', { class: 'tb-btn icon-only', type: 'button', title: 'Close', onclick: () => finish(null) }, icon('close'))),
+      onclick: () => finish(b.value),
+    }, b.label));
+    const box = h('div', { class: 'modal', role: 'dialog' },
+      h('div', { class: 'modal-head' }, h('h2', { text: title }),
+        h('button', { class: 'tb-btn icon-only', type: 'button', title: 'Close', onclick: () => finish(null) }, icon('close'))),
       h('div', { class: 'modal-body' }, body),
-      btnRow);
-    root.append(h('div', { class: 'modal-backdrop', onmousedown: (e) => { if (e.target === e.currentTarget) finish(null); } }, form));
-    root.classList.add('open');
-    openModal = { finish };
-    requestAnimationFrame(() => {
-      const f = initialFocus || form.querySelector('input:not([type=hidden]), textarea, select') || form.querySelector('.btn.primary');
-      if (f) f.focus();
-    });
+      h('div', { class: 'modal-buttons' }, btns));
+    root.append(h('div', { class: 'modal-backdrop', onmousedown: (e) => { if (e.target === e.currentTarget) finish(null); } }, box));
+    finishOpen = finish;
+    // For risky actions the safe button gets focus, so a stray Space or Enter does nothing harmful.
+    const focusBtn = focusCancel ? btns[0] : btns.find((b, i) => buttons[i].primary) || btns[0];
+    requestAnimationFrame(() => focusBtn && focusBtn.focus());
   });
-}
-
-export function closeModal(value = null) {
-  if (openModal) openModal.finish(value);
 }
 
 export function confirmDialog(title, message, { ok = 'OK', cancel = 'Cancel', danger = false } = {}) {
@@ -58,21 +42,26 @@ export function confirmDialog(title, message, { ok = 'OK', cancel = 'Cancel', da
     title,
     body: h('p', { class: 'modal-text', text: message }),
     buttons: [{ label: cancel, value: false }, { label: ok, value: true, primary: !danger, danger }],
+    focusCancel: danger,
   }).then((v) => v === true);
 }
 
-export function toast(message, type = 'info', ms) {
+/** Show a short message. `action`: optional { label, run } button, e.g. Undo. */
+export function toast(message, type = 'info', { ms, action } = {}) {
   const root = document.getElementById('toasts');
-  const el = h('div', { class: `toast ${type}` },
-    icon(type === 'error' || type === 'warn' ? 'warn' : 'note'),
-    h('span', { text: message }),
-    h('button', { class: 'toast-x', title: 'Dismiss', onclick: () => el.remove() }, icon('close')));
-  // Don't stack the same message twice.
   for (const t of [...root.children]) if (t.dataset.msg === message) t.remove();
-  el.dataset.msg = message;
+  const el = h('div', { class: `toast ${type}`, dataset: { msg: message } },
+    icon(type === 'info' ? 'info' : 'warn'),
+    h('span', { class: 'toast-text', text: message }),
+    action ? h('button', { class: 'toast-action', onclick: () => { el.remove(); action.run(); } }, action.label) : null,
+    h('button', { class: 'toast-x', title: 'Dismiss', onclick: () => el.remove() }, icon('close')));
   root.append(el);
   while (root.children.length > 3) root.firstChild.remove();
-  setTimeout(() => el.classList.add('leaving'), (ms ?? (type === 'error' ? 9000 : type === 'warn' ? 7000 : 4000)));
-  setTimeout(() => el.remove(), (ms ?? (type === 'error' ? 9000 : type === 'warn' ? 7000 : 4000)) + 400);
-  return el;
+  const life = ms ?? (type === 'error' ? 9000 : type === 'warn' ? 6000 : action ? 6000 : 3500);
+  setTimeout(() => el.classList.add('leaving'), life);
+  setTimeout(() => el.remove(), life + 400);
+}
+
+export function clearToasts() {
+  document.getElementById('toasts').innerHTML = '';
 }

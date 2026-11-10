@@ -7,21 +7,17 @@
   <link rel="stylesheet" href="styles.css">
   <script type="module" src="js/app.js"></script>
 </head>
-<body class="mode-edit">
-  <div id="home" class="screen hidden"></div>
+<body>
+  <div id="home" class="hidden"></div>
 
-  <div id="showScreen" class="screen hidden">
+  <div id="showScreen" class="hidden">
     <header id="topbar"></header>
-    <section id="transport"></section>
     <main id="workspace">
       <section id="scriptPane" class="pane"></section>
-      <div id="splitV" class="splitter-v" title="Drag to resize"></div>
-      <section id="cuePane" class="pane">
-        <div id="cueListPane"></div>
-        <div id="splitH" class="splitter-h edit-only" title="Drag to resize"></div>
-        <div id="inspector" class="edit-only"></div>
-      </section>
+      <div id="splitter" title="Drag to resize"></div>
+      <section id="playlistPane" class="pane"></section>
     </main>
+    <footer id="playerBar"></footer>
   </div>
 
   <div id="toasts"></div>

@@ -1,4 +1,4 @@
-// Narrow bridge between the sandboxed UI and the main process.
+// Narrow bridge between the sandboxed window and the main process.
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 async function call(channel, ...args) {
@@ -24,18 +24,16 @@ contextBridge.exposeInMainWorld('cuebook', {
 
   pickScript: () => call('script:pick'),
   importScript: (p) => call('script:import', p),
-  saveScriptText: (text) => call('script:saveText', text),
   readScriptText: (rel) => call('script:readText', rel),
   docxToHtml: (rel) => call('script:docxToHtml', rel),
 
-  reveal: (rel) => call('shell:reveal', rel),
-  setShowMode: (on) => call('app:setShowMode', on),
-  setStandby: (id) => call('app:setStandby', id),
-  getRecovery: () => call('app:getRecovery'),
+  reveal: () => call('shell:reveal'),
+  keepAwake: (on) => call('app:keepAwake', on),
+  takePendingOpen: () => call('app:takePendingOpen'),
   setTitle: (t) => call('app:setTitle', t),
   closeReply: (info) => call('app:closeReply', info),
 
-  /** Real disk path of a File from a drag-and-drop (empty string if none). */
+  /** Real disk path of a dropped File (empty string if none). */
   pathForFile: (file) => {
     try { return webUtils.getPathForFile(file) || ''; } catch { return ''; }
   },

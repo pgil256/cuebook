@@ -1,628 +1,730 @@
-// Cuebook renderer entry: wires the store, audio engine and player to the UI,
-// owns every user action, keyboard handling and the per-frame update loop.
+// Cuebook: a simple media player for a show.
+// Script on the left, playlist on the right, player controls along the bottom.
 
-import { h, $, numberBetween, compareAnchors, basename } from './util.js';
+import { h, $, clamp, uid, formatTime, debounce, basename, isAudioPath, isScriptPath } from './util.js';
 import { icon } from './icons.js';
-import { store, makeAudioCue, makeFadeCue } from './store.js';
-import { AudioEngine } from './audio.js';
 import { Player } from './player.js';
 import { ScriptView } from './script-view.js';
-import { CueList } from './cue-list.js';
-import { Inspector } from './inspector.js';
-import { Transport } from './transport.js';
 import { Home } from './home.js';
-import { modal, confirmDialog, toast, isModalOpen, closeModal } from './dialogs.js';
+import { modal, confirmDialog, toast, clearToasts, isModalOpen, closeModal } from './dialogs.js';
 
 const api = window.cuebook;
-const engine = new AudioEngine();
-const player = new Player(engine);
+const player = new Player();
+const TRACK_DRAG = 'application/x-cuebook-track';
 
-let scriptView, cueList, inspector, transport, home;
-
-// ---------------------------------------------------------------- actions
-
-function requireEdit() {
-  if (store.editing) return true;
-  toast('The show is locked in Show mode. Switch to Edit to make changes.', 'warn');
-  return false;
-}
-
-function prettyName(name) {
-  return name.replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-/** Where a new cue dropped at `anchor` belongs in the list: after the last cue pinned at or before it. */
-function indexForAnchor(cues, anchor) {
-  let last = -1, firstPinned = -1;
-  cues.forEach((c, i) => {
-    if (!c.anchor || !scriptView.isPlaceable(c.anchor)) return;
-    if (firstPinned < 0) firstPinned = i;
-    if (compareAnchors(c.anchor, anchor) <= 0) last = i;
-  });
-  if (last >= 0) return last + 1;
-  return firstPinned >= 0 ? firstPinned : cues.length;
-}
-
-const actions = {
-  go() {
-    if (!store.show) return;
-    const r = player.go();
-    if (r === 'empty' && store.cues.length) toast('End of the cue list. Double-click a cue or use ↑ ↓ to choose the next one.', 'info', 2500);
-  },
-
-  async setMode(mode) {
-    if (!store.show || store.mode === mode) return;
-    if (mode === 'edit') {
-      const ok = await confirmDialog('Unlock editing?', 'Edit mode lets cues be changed, moved and deleted. Switch back to Show mode before the performance.', { ok: 'Unlock' });
-      if (!ok) return;
-    }
-    scriptView.cancelPinMode();
-    store.pref((s) => { s.mode = mode; }, { mode: true });
-    api.setShowMode(mode === 'show').catch(() => {});
-  },
-
-  async setOutput(deviceId) {
-    const dev = (transport.devices || []).find((d) => d.deviceId === deviceId);
-    try {
-      await engine.setOutput(deviceId);
-      store.pref((s) => { s.outputDeviceId = deviceId; s.outputDeviceLabel = dev ? dev.label : ''; }, { output: true });
-      toast(deviceId ? `Sound now goes to “${dev ? dev.label : 'the selected output'}”.` : 'Sound now goes to the system default output.', 'info', 2500);
-    } catch (err) {
-      toast(`Couldn't use that output: ${err.message}`, 'error');
-      transport.refreshDevices();
-    }
-  },
-
-  async resetClock() {
-    if (player.showClockStart === null) return;
-    if (await confirmDialog('Reset the show clock?', 'The running time goes back to 00:00:00 and starts again on the next GO.', { ok: 'Reset' })) player.resetShowClock();
-  },
-
-  async closeShow() {
-    if (!store.show) return;
-    if (player.playing && !(await confirmDialog('Close the show?', 'Sound is still playing. It will stop.', { ok: 'Stop and close', danger: true }))) return;
-    player.silence();
-    player.cancelPreload();
-    await store.flush().catch(() => {});
-    await api.closeShow().catch(() => {});
-    await api.setShowMode(false).catch(() => {});
-    store.unload();
-    engine.clear();
-    await scriptView.load(null);
-    player.standbyId = null;
-    player.showClockStart = null;
-    $('#toasts').innerHTML = ''; // messages about the closed show no longer apply
-    showScreen('home');
-    api.setTitle('Cuebook');
-    home.render();
-  },
-
-  // ----- script -----
-
-  async importScriptDialog() {
-    if (!requireEdit()) return;
-    const p = await api.pickScript().catch((e) => { toast(e.message, 'error'); return null; });
-    if (p) await actions.importScript(p);
-  },
-
-  async importScript(path) {
-    if (!requireEdit()) return;
-    if (store.show.script) {
-      const ok = await confirmDialog('Replace the script?', `“${basename(path)}” will replace the current script. Cue pins stay where they are on the page, so check they still line up.`, { ok: 'Replace' });
-      if (!ok) return;
-    }
-    try {
-      const info = await api.importScript(path);
-      await setScript(info);
-    } catch (err) {
-      toast(err.message, 'error');
-    }
-  },
-
-  async pasteScript() {
-    if (!requireEdit()) return;
-    const ta = h('textarea', { class: 'paste-area', placeholder: 'Paste the script text here…', spellcheck: false });
-    const text = await modal({
-      title: 'Paste script text',
-      wide: true,
-      body: h('div', {}, h('p', { class: 'hint', text: 'Each line becomes a spot you can pin cues to. The text is saved as a .txt file in the show folder.' }), ta),
-      buttons: [{ label: 'Cancel', value: null }, { label: 'Use this script', primary: true }],
-      onSubmit: () => (ta.value.trim() ? ta.value : (toast('Paste some text first.', 'warn'), undefined)),
-    });
-    if (!text) return;
-    if (store.show.script && !(await confirmDialog('Replace the script?', 'The pasted text will replace the current script.', { ok: 'Replace' }))) return;
-    try {
-      const info = await api.saveScriptText(text);
-      await setScript(info);
-    } catch (err) {
-      toast(err.message, 'error');
-    }
-  },
-
-  // ----- cues -----
-
-  async addAudioDialog() {
-    if (!requireEdit()) return;
-    const paths = await api.pickAudio().catch(() => []);
-    if (!paths.length) return;
-    const sel = store.cueIndex(store.selectedId);
-    await actions.addAudio(paths, { index: sel >= 0 ? sel + 1 : store.cues.length });
-  },
-
-  async addAudio(paths, { index = null, anchor = null } = {}) {
-    if (!requireEdit()) return;
-    let results;
-    try {
-      results = await api.importMedia(paths);
-    } catch (err) {
-      toast(err.message, 'error');
-      return;
-    }
-    for (const r of results) if (r.error) toast(r.error, 'warn');
-    const ok = results.filter((r) => r.file);
-    if (!ok.length) return;
-    const newIds = [];
-    store.edit((show) => {
-      let at = anchor ? indexForAnchor(show.cues, anchor) : Math.max(0, Math.min(index ?? show.cues.length, show.cues.length));
-      const taken = new Set(show.cues.map((c) => c.number));
-      for (const r of ok) {
-        const cue = makeAudioCue(r.file, prettyName(r.name), show.settings);
-        cue.number = numberBetween(show.cues[at - 1]?.number, show.cues[at]?.number, taken);
-        taken.add(cue.number);
-        if (anchor) cue.anchor = { ...anchor };
-        show.cues.splice(at, 0, cue);
-        newIds.push(cue.id);
-        at++;
-      }
-    });
-    store.select(newIds[0]);
-    if (!player.standbyId) player.setStandby(store.cues[0].id);
-    for (const r of ok) engine.load(r.file).catch(() => {});
-    toast(`Added ${ok.length} cue${ok.length === 1 ? '' : 's'}${anchor ? ', pinned to the script' : ''}.`, 'info', 2500);
-  },
-
-  addFadeCue() {
-    if (!requireEdit()) return;
-    let id;
-    store.edit((show) => {
-      const sel = show.cues.findIndex((c) => c.id === store.selectedId);
-      const at = sel >= 0 ? sel + 1 : show.cues.length;
-      const cue = makeFadeCue();
-      cue.number = numberBetween(show.cues[at - 1]?.number, show.cues[at]?.number, new Set(show.cues.map((c) => c.number)));
-      show.cues.splice(at, 0, cue);
-      id = cue.id;
-    });
-    store.select(id);
-    if (!player.standbyId) player.setStandby(store.cues[0].id);
-  },
-
-  moveCue(id, index) {
-    if (!requireEdit()) return;
-    const from = store.cueIndex(id);
-    if (from < 0) return;
-    const to = index > from ? index - 1 : index;
-    if (to === from) return;
-    store.edit((show) => {
-      const [c] = show.cues.splice(from, 1);
-      show.cues.splice(to, 0, c);
-    });
-  },
-
-  pinCue(id, anchor) {
-    if (!requireEdit()) return;
-    store.edit((show) => {
-      const c = show.cues.find((x) => x.id === id);
-      if (c) c.anchor = { b: anchor.b, y: anchor.y };
-    });
-    store.select(id);
-    // Warn when the pin lands out of order with its neighbours in the list.
-    const cues = store.cues;
-    const i = store.cueIndex(id);
-    const prev = cues.slice(0, i).reverse().find((c) => c.anchor && scriptView.isPlaceable(c.anchor));
-    const next = cues.slice(i + 1).find((c) => c.anchor && scriptView.isPlaceable(c.anchor));
-    if ((prev && compareAnchors(anchor, prev.anchor) < 0) || (next && compareAnchors(anchor, next.anchor) > 0)) {
-      toast(`Q${cues[i].number} is now out of order with the script. Use “Sort by script” to reorder the list.`, 'warn');
-    }
-  },
-
-  unpinCue(id) {
-    if (!requireEdit()) return;
-    store.edit((show) => { const c = show.cues.find((x) => x.id === id); if (c) c.anchor = null; });
-  },
-
-  deleteCue(id) {
-    if (!requireEdit()) return;
-    const i = store.cueIndex(id);
-    if (i < 0) return;
-    const cue = store.cues[i];
-    store.edit((show) => { show.cues.splice(i, 1); });
-    const neighbour = store.cues[i] || store.cues[i - 1] || null;
-    if (store.selectedId === id) store.select(neighbour ? neighbour.id : null);
-    if (player.standbyId === id) player.setStandby(neighbour ? neighbour.id : null, { scroll: false });
-    toast(`Deleted Q${cue.number} “${cue.name}”. Ctrl+Z to undo.`, 'info', 4000);
-  },
-
-  async replaceFile(id) {
-    if (!requireEdit()) return;
-    const paths = await api.pickAudio().catch(() => []);
-    if (!paths.length) return;
-    const [r] = await api.importMedia([paths[0]]);
-    if (!r || r.error) { toast(r ? r.error : 'Import failed', 'error'); return; }
-    engine.forget(r.file);
-    store.edit((show) => {
-      const c = show.cues.find((x) => x.id === id);
-      if (!c) return;
-      c.file = r.file;
-      if (!c.name) c.name = prettyName(r.name);
-      c.trimStart = 0;
-      c.trimEnd = null;
-    });
-    await player.checkFiles();
-    engine.load(r.file).catch(() => {});
-    inspector.render();
-  },
-
-  async renumber() {
-    if (!requireEdit() || !store.cues.length) return;
-    if (!(await confirmDialog('Renumber all cues?', 'Every cue gets a whole number in list order: 1, 2, 3… Update the prompt book to match.', { ok: 'Renumber' }))) return;
-    store.edit((show) => { show.cues.forEach((c, i) => { c.number = String(i + 1); }); });
-  },
-
-  sortByScript() {
-    if (!requireEdit()) return;
-    const slots = [];
-    const pinned = [];
-    store.cues.forEach((c, i) => {
-      if (c.anchor && scriptView.isPlaceable(c.anchor)) { slots.push(i); pinned.push(c); }
-    });
-    const sorted = [...pinned].sort((a, b) => compareAnchors(a.anchor, b.anchor));
-    if (sorted.every((c, i) => c === pinned[i])) { toast('The pinned cues are already in script order.', 'info', 2500); return; }
-    store.edit((show) => {
-      const out = [...show.cues];
-      slots.forEach((slot, k) => { out[slot] = sorted[k]; });
-      show.cues = out;
-    });
-    toast('Cues reordered to match the script. Unpinned cues stayed where they were. Renumber if the numbers are now out of order.', 'info', 6000);
-  },
-
-  async openSettings() {
-    if (!requireEdit()) return;
-    const s = store.show.settings;
-    const nameIn = h('input', { type: 'text', value: store.show.name });
-    const stopIn = h('input', { type: 'number', min: '0', step: '0.5', value: String(s.defaultStopFade), class: 'num' });
-    const guardSel = h('select', {}, ...[[0, 'Off'], [250, '0.25 s'], [500, '0.5 s (recommended)'], [750, '0.75 s'], [1000, '1 s']].map(([v, t]) => h('option', { value: String(v), text: t })));
-    guardSel.value = String(s.goGuardMs);
-    if (guardSel.value !== String(s.goGuardMs)) { guardSel.append(h('option', { value: String(s.goGuardMs), text: `${s.goGuardMs} ms` })); guardSel.value = String(s.goGuardMs); }
-    const panicIn = h('input', { type: 'number', min: '0', step: '0.5', value: String(s.panicFade), class: 'num' });
-    const applyAll = h('input', { type: 'checkbox' });
-    const field = (label, ctl, hint) => h('label', { class: 'field' }, h('span', { class: 'field-label', text: label }), ctl, hint ? h('span', { class: 'hint', text: hint }) : null);
-    const res = await modal({
-      title: 'Show settings',
-      body: h('div', { class: 'settings-form' },
-        field('Show name', nameIn),
-        field('Default “fade when stopped” for new cues (s)', stopIn, 'How long a sound takes to fade out when a later cue (or STOP ALL) ends it.'),
-        h('label', { class: 'check' }, applyAll, h('span', { text: 'Also apply it to every existing sound cue' })),
-        field('Double-GO protection', guardSel, 'Ignore a second GO pressed this soon after the last one, so a fumbled double-tap doesn’t skip a cue.'),
-        field('STOP ALL fade time (s)', panicIn, 'Esc / STOP ALL fades everything out over this time. Press it twice to cut instantly.'),
-        h('p', { class: 'hint', text: `Show folder: ${store.dir}` })),
-      buttons: [{ label: 'Cancel', value: null }, { label: 'Save', primary: true }],
-      onSubmit: () => true,
-    });
-    if (!res) return;
-    const stop = Math.max(0, Number(stopIn.value) || 0);
-    const name = nameIn.value.trim() || store.show.name;
-    if (name !== store.show.name || applyAll.checked) {
-      store.edit((show) => {
-        show.name = name;
-        if (applyAll.checked) show.cues.forEach((c) => { if (c.type === 'audio') c.stopFade = stop; });
-      }, { what: { cues: true, name: true } });
-    }
-    store.pref((st) => {
-      st.defaultStopFade = stop;
-      st.goGuardMs = Math.max(0, Number(guardSel.value) || 0);
-      st.panicFade = Math.max(0, Number(panicIn.value) || 0);
-    });
-  },
-
-  showShortcuts() {
-    const rows = [
-      ['Space', 'GO: fire the standby cue'],
-      ['Esc', 'STOP ALL: fade out everything (press twice to cut instantly)'],
-      ['↑ / ↓', 'Move the standby to the previous / next cue'],
-      ['Double-click a cue', 'Make it the standby (jump to it)'],
-      ['Delete', 'Delete the selected cue (Edit mode)'],
-      ['Ctrl+Z / Ctrl+Y', 'Undo / redo (Edit mode)'],
-      ['Alt+click the script', 'Pin the selected cue there (Edit mode)'],
-      ['Ctrl+scroll on the script', 'Zoom the script'],
-    ];
-    modal({
-      title: 'Keyboard shortcuts',
-      body: h('table', { class: 'shortcuts' }, ...rows.map(([k, d]) => h('tr', {}, h('td', {}, h('kbd', { text: k })), h('td', { text: d })))),
-      buttons: [{ label: 'Close', value: true, primary: true }],
-    });
-  },
+const state = {
+  dir: null,
+  show: null,              // { name, script, volume, tracks: [{ id, file, name }] }
+  selectedId: null,
+  durations: new Map(),    // file -> seconds | null (unknown) | 'error'
+  missing: new Set(),      // files not found in the show folder
+  muted: false,
+  lastRemoved: null,       // { track, index } for Undo
+  dirty: false,
 };
 
-async function setScript(info) {
-  store.edit((show) => { show.script = info; }, { what: { script: true } });
-  await scriptView.load(info); // same promise the store listener started
-  if (store.cues.some((c) => c.anchor)) toast('Existing cue pins were kept. Check they still line up with the new script.', 'warn');
+const els = {};
+let scriptView;
+let home;
+
+const mediaUrl = (rel) => 'app://local/show/' + rel.split('/').map(encodeURIComponent).join('/');
+const tracks = () => (state.show ? state.show.tracks : []);
+const trackById = (id) => tracks().find((t) => t.id === id) || null;
+const indexOf = (id) => tracks().findIndex((t) => t.id === id);
+const tidyName = (name) => name.replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+
+// ------------------------------------------------------------------ saving
+
+let saveChain = Promise.resolve();
+function writeShow() {
+  saveChain = saveChain.then(async () => {
+    if (!state.show || !state.dirty) return;
+    state.dirty = false;
+    state.show.modifiedAt = new Date().toISOString();
+    try {
+      await api.saveShow(JSON.stringify(state.show, null, 2));
+    } catch (err) {
+      state.dirty = true;
+      toast(`Couldn't save the show: ${err.message}. Trying again…`, 'error');
+      setTimeout(() => save(), 5000);
+    }
+  });
+  return saveChain;
+}
+const save = debounce(writeShow, 400);
+function changed() { state.dirty = true; save(); }
+async function flushSave() { save.cancel(); await writeShow(); }
+
+// ------------------------------------------------------------------ playback
+
+function playTrack(id) {
+  const t = trackById(id);
+  if (!t) return;
+  if (state.missing.has(t.file)) { toast(`The music file for “${t.name}” is missing from the show folder.`, 'error'); return; }
+  if (player.track && player.track.id === id) player.seek(0);
+  else player.load(t, mediaUrl(t.file));
+  select(id, true);
+  player.play();
 }
 
-// ---------------------------------------------------------------- show lifecycle
+/** Space / the big button. With nothing loaded, starts the selected (or first) track. */
+function togglePlay() {
+  if (!player.track) {
+    const t = trackById(state.selectedId) || tracks()[0];
+    if (t) playTrack(t.id);
+    return;
+  }
+  if (player.playing) player.pause(); else player.play();
+}
+
+/** Load the next/previous track; keep playing if we were playing. */
+function step(delta) {
+  const ts = tracks();
+  const base = player.track ? indexOf(player.track.id) : indexOf(state.selectedId);
+  const i = base + delta;
+  if (i < 0 || i >= ts.length) return;
+  const wasPlaying = player.playing;
+  player.load(ts[i], mediaUrl(ts[i].file));
+  select(ts[i].id, true);
+  if (wasPlaying) player.play();
+}
+
+/** Previous: restart the song if it has been playing a few seconds, otherwise go back a track. */
+function prev() {
+  if (player.track && player.time > 3) player.seek(0);
+  else step(-1);
+}
+
+/** When a song finishes, get the next one ready (but don't start it). */
+function onTrackEnded() {
+  const nextTrack = tracks()[indexOf(player.track && player.track.id) + 1];
+  if (nextTrack) {
+    player.load(nextTrack, mediaUrl(nextTrack.file));
+    select(nextTrack.id, true);
+  } else {
+    player.stop();
+  }
+}
+
+function onPlayError(t) {
+  state.durations.set(t.file, 'error');
+  updateRows();
+  toast(`Couldn't play “${t.name}”. The file is missing or isn't a supported audio format.`, 'error');
+}
+
+function applyVolume() {
+  const v = clamp(Number(state.show?.volume ?? 1), 0, 1);
+  player.setVolume(v, state.muted);
+  els.vol.value = String(Math.round(v * 100));
+  els.volVal.textContent = state.muted ? 'Muted' : `${Math.round(v * 100)}%`;
+  els.mute.innerHTML = '';
+  els.mute.append(icon(state.muted || v === 0 ? 'mute' : 'volume'));
+  els.mute.title = state.muted ? 'Unmute' : 'Mute';
+}
+
+// ------------------------------------------------------------------ playlist
+
+function select(id, scroll = false) {
+  state.selectedId = id;
+  updateRows();
+  if (scroll) {
+    const row = els.list.querySelector(`.track[data-id="${CSS.escape(id)}"]`);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function moveSelection(delta) {
+  const ts = tracks();
+  if (!ts.length) return;
+  let i = indexOf(state.selectedId);
+  if (i < 0) i = delta > 0 ? -1 : ts.length;
+  select(ts[clamp(i + delta, 0, ts.length - 1)].id, true);
+}
+
+async function addAudio(paths, index = null) {
+  let results;
+  try {
+    results = await api.importMedia(paths);
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  }
+  for (const r of results) if (r.error) toast(r.error, 'warn');
+  const ok = results.filter((r) => r.file);
+  if (!ok.length || !state.show) return;
+  const at = index == null ? tracks().length : clamp(index, 0, tracks().length);
+  const added = ok.map((r) => ({ id: uid('t'), file: r.file, name: tidyName(r.name) }));
+  state.show.tracks.splice(at, 0, ...added);
+  for (const t of added) { state.missing.delete(t.file); if (state.durations.get(t.file) === 'error') state.durations.delete(t.file); }
+  if (!state.selectedId) state.selectedId = added[0].id;
+  changed();
+  renderPlaylist();
+  loadDurations();
+}
+
+async function addAudioDialog() {
+  const paths = await api.pickAudio().catch(() => []);
+  if (paths.length) await addAudio(paths);
+}
+
+async function removeTrack(id) {
+  const i = indexOf(id);
+  if (i < 0) return;
+  const t = tracks()[i];
+  const isCurrent = player.track && player.track.id === id;
+  if (isCurrent && player.playing) {
+    const ok = await confirmDialog('Remove the song that is playing?', `“${t.name}” will stop and be taken off the playlist.`, { ok: 'Stop and remove', danger: true });
+    if (!ok || indexOf(id) < 0) return;
+  }
+  state.show.tracks.splice(indexOf(id), 1);
+  if (isCurrent) player.unload();
+  if (state.selectedId === id) state.selectedId = (tracks()[i] || tracks()[i - 1] || {}).id || null;
+  state.lastRemoved = { track: t, index: i };
+  changed();
+  renderPlaylist();
+  toast(`Removed “${t.name}”.`, 'info', { action: { label: 'Undo', run: undoRemove } });
+}
+
+function undoRemove() {
+  const r = state.lastRemoved;
+  if (!r || !state.show) return;
+  state.lastRemoved = null;
+  state.show.tracks.splice(Math.min(r.index, tracks().length), 0, r.track);
+  state.selectedId = r.track.id;
+  changed();
+  renderPlaylist();
+}
+
+function moveTrack(id, toIndex) {
+  const from = indexOf(id);
+  if (from < 0) return;
+  const to = toIndex > from ? toIndex - 1 : toIndex;
+  if (to === from) return;
+  const [t] = state.show.tracks.splice(from, 1);
+  state.show.tracks.splice(to, 0, t);
+  changed();
+  renderPlaylist();
+}
+
+function renderPlaylist() {
+  const ts = tracks();
+  els.count.textContent = ts.length ? `${ts.length} song${ts.length === 1 ? '' : 's'}` : '';
+  els.list.innerHTML = '';
+  els.playlistEmpty.classList.toggle('hidden', ts.length > 0);
+  els.listScroll.classList.toggle('hidden', ts.length === 0);
+  for (const t of ts) {
+    const playBtn = h('button', { class: 'tr-play', title: 'Play', onclick: (e) => { e.stopPropagation(); rowPlay(t.id); } }, icon('play'));
+    els.list.append(h('div', { class: 'track', draggable: 'true', dataset: { id: t.id } },
+      h('span', { class: 'tr-num' }, h('span', { class: 'tr-index' }), playBtn),
+      h('div', { class: 'tr-main' }, h('div', { class: 'tr-name', text: t.name, title: t.name }), h('div', { class: 'tr-sub' })),
+      h('span', { class: 'tr-dur' }),
+      h('button', { class: 'tr-remove', title: 'Remove from the playlist (Delete)', onclick: (e) => { e.stopPropagation(); removeTrack(t.id); } }, icon('close'))));
+  }
+  updateRows();
+  refreshPlayerState();
+}
+
+/** The little play button on a row: plays that song, or pauses it if it's the one playing. */
+function rowPlay(id) {
+  if (player.track && player.track.id === id) togglePlay();
+  else playTrack(id);
+}
+
+/** Cheap refresh of row highlights, durations and problems. */
+function updateRows() {
+  if (!els.list) return;
+  [...els.list.children].forEach((row, i) => {
+    const t = trackById(row.dataset.id);
+    if (!t) return;
+    const current = !!player.track && player.track.id === t.id;
+    const playing = current && player.playing;
+    row.classList.toggle('selected', t.id === state.selectedId);
+    row.classList.toggle('current', current);
+    row.classList.toggle('playing', playing);
+
+    const idx = row.querySelector('.tr-index');
+    const mode = playing ? 'playing' : current ? 'paused' : `n${i + 1}`;
+    if (idx.dataset.mode !== mode) {
+      idx.dataset.mode = mode;
+      idx.innerHTML = '';
+      if (playing) idx.append(h('span', { class: 'eq' }, h('i'), h('i'), h('i')));
+      else if (current) idx.append(icon('pause'));
+      else idx.textContent = String(i + 1);
+    }
+    const btn = row.querySelector('.tr-play');
+    const want = playing ? 'pause' : 'play';
+    if (btn.dataset.icon !== want) { btn.dataset.icon = want; btn.innerHTML = ''; btn.append(icon(want)); btn.title = playing ? 'Pause' : 'Play'; }
+
+    const d = state.durations.get(t.file);
+    const missing = state.missing.has(t.file);
+    row.classList.toggle('bad', missing || d === 'error');
+    row.querySelector('.tr-dur').textContent = typeof d === 'number' ? formatTime(d) : '';
+    row.querySelector('.tr-sub').textContent = missing ? 'File missing from the show folder' : d === 'error' ? "Can't play this file" : '';
+  });
+}
+
+let durationToken = 0;
+/** Look up each song's length (just the file header) to show in the list. */
+async function loadDurations() {
+  const token = ++durationToken;
+  for (const t of [...tracks()]) {
+    if (token !== durationToken || !state.show) return;
+    if (state.durations.has(t.file) || state.missing.has(t.file)) continue;
+    const d = await probeDuration(mediaUrl(t.file));
+    if (token !== durationToken) return;
+    state.durations.set(t.file, d);
+    updateRows();
+  }
+}
+
+function probeDuration(url) {
+  return new Promise((resolve) => {
+    const a = new Audio();
+    a.preload = 'metadata';
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      a.removeAttribute('src');
+      a.load();
+      resolve(v);
+    };
+    const timer = setTimeout(() => done(null), 10000);
+    a.addEventListener('loadedmetadata', () => done(Number.isFinite(a.duration) ? a.duration : null));
+    a.addEventListener('error', () => done('error'));
+    a.src = url;
+  });
+}
+
+// ------------------------------------------------------------------ player bar
+
+function refreshPlayerState() {
+  if (!state.show) return;
+  const t = player.track;
+  const playing = player.playing;
+  const want = playing ? 'pause' : 'play';
+  if (els.play.dataset.icon !== want) { els.play.dataset.icon = want; els.play.innerHTML = ''; els.play.append(icon(want)); }
+  els.play.title = playing ? 'Pause (Space)' : 'Play (Space)';
+  const label = !t ? '' : playing ? 'Playing' : player.time < 0.05 ? 'Ready' : 'Paused';
+  els.nowLabel.textContent = label;
+  els.nowLabel.className = `now-label ${label.toLowerCase()}`;
+  els.nowName.textContent = t ? t.name
+    : tracks().length ? 'Press play, or double-click a song' : 'Add music to the playlist to get started';
+  els.nowName.classList.toggle('idle', !t);
+  updateRows();
+  if (state.awake !== playing) { state.awake = playing; api.keepAwake(playing).catch(() => {}); }
+}
+
+let seekDrag = null; // time the seek handle is being dragged to
+
+function seekTimeAt(clientX) {
+  const r = els.seek.getBoundingClientRect();
+  return clamp((clientX - r.left) / r.width, 0, 1) * player.duration;
+}
+
+function buildPlayerBar() {
+  els.prev = h('button', { class: 'pb-btn', title: 'Previous song (or back to the start of this one)', onclick: prev }, icon('prev'));
+  els.play = h('button', { class: 'pb-play', title: 'Play (Space)', onclick: togglePlay }, icon('play'));
+  els.stop = h('button', { class: 'pb-btn', title: 'Stop (Esc)', onclick: () => player.stop() }, icon('stop'));
+  els.next = h('button', { class: 'pb-btn', title: 'Next song', onclick: () => step(1) }, icon('next'));
+  els.nowLabel = h('span', { class: 'now-label' });
+  els.nowName = h('span', { class: 'now-name' });
+  els.elapsed = h('span', { class: 'time' });
+  els.remaining = h('span', { class: 'time remaining' });
+  els.fill = h('div', { class: 'seek-fill' });
+  els.thumb = h('div', { class: 'seek-thumb' });
+  els.tip = h('div', { class: 'seek-tip hidden' });
+  els.seek = h('div', { class: 'seek disabled', title: 'Click or drag to jump to any point' }, h('div', { class: 'seek-track' }, els.fill), els.thumb, els.tip);
+  els.mute = h('button', { class: 'pb-btn small', onclick: () => { state.muted = !state.muted; applyVolume(); } });
+  els.vol = h('input', { type: 'range', min: '0', max: '100', step: '1', class: 'vol', title: 'Volume' });
+  els.volVal = h('span', { class: 'vol-val' });
+  els.vol.addEventListener('input', () => {
+    state.show.volume = Number(els.vol.value) / 100;
+    state.muted = false;
+    applyVolume();
+    changed();
+  });
+  els.vol.addEventListener('change', () => els.vol.blur());
+
+  $('#playerBar').append(
+    h('div', { class: 'pb-transport' }, els.prev, els.play, els.stop, els.next),
+    h('div', { class: 'pb-now' },
+      h('div', { class: 'now-head' }, els.nowLabel, els.nowName),
+      h('div', { class: 'seek-row' }, els.elapsed, els.seek, els.remaining)),
+    h('div', { class: 'pb-volume' }, els.mute, els.vol, els.volVal));
+
+  const s = els.seek;
+  s.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !player.track || !player.duration) return;
+    e.preventDefault();
+    s.setPointerCapture(e.pointerId);
+    s.classList.add('dragging');
+    seekDrag = seekTimeAt(e.clientX);
+    player.seek(seekDrag);
+  });
+  s.addEventListener('pointermove', (e) => {
+    if (!player.track || !player.duration) { els.tip.classList.add('hidden'); return; }
+    const t = seekTimeAt(e.clientX);
+    const r = s.getBoundingClientRect();
+    els.tip.textContent = formatTime(t);
+    els.tip.style.left = `${clamp(e.clientX - r.left, 0, r.width)}px`;
+    els.tip.classList.remove('hidden');
+    if (seekDrag !== null) { seekDrag = t; player.seek(t); }
+  });
+  const endDrag = () => { if (seekDrag !== null) { seekDrag = null; s.classList.remove('dragging'); } };
+  s.addEventListener('pointerup', endDrag);
+  s.addEventListener('pointercancel', endDrag);
+  s.addEventListener('pointerleave', () => { if (seekDrag === null) els.tip.classList.add('hidden'); });
+}
+
+/** Every frame: move the seek bar and the clocks. */
+function frame() {
+  if (state.show) {
+    const dur = player.duration;
+    const pos = seekDrag ?? player.time;
+    const pct = `${((dur ? clamp(pos / dur, 0, 1) : 0) * 100).toFixed(3)}%`;
+    if (els.pct !== pct) { els.pct = pct; els.fill.style.width = pct; els.thumb.style.left = pct; }
+    const el = formatTime(pos);
+    const rem = `−${formatTime(dur ? dur - pos : 0)}`;
+    if (els.elapsed.textContent !== el) els.elapsed.textContent = el;
+    if (els.remaining.textContent !== rem) els.remaining.textContent = rem;
+    const off = !player.track || !dur;
+    if (els.seekOff !== off) { els.seekOff = off; els.seek.classList.toggle('disabled', off); }
+  }
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------------------ playlist pane & drops
+
+function buildPlaylistPane() {
+  els.count = h('span', { class: 'pane-sub' });
+  els.list = h('div', { class: 'track-list' });
+  els.dropLine = h('div', { class: 'drop-line hidden' });
+  els.listScroll = h('div', { class: 'track-scroll' }, els.list, els.dropLine);
+  els.playlistEmpty = h('div', { class: 'pane-empty' },
+    h('div', { class: 'dropzone' },
+      icon('music', 'big'),
+      h('h3', { text: 'Drop music here' }),
+      h('p', { text: 'MP3, WAV, M4A, OGG or FLAC. The files are copied into the show folder.' }),
+      h('button', { class: 'btn primary', onclick: addAudioDialog }, icon('plus'), h('span', { text: 'Add music…' }))));
+  const pane = $('#playlistPane');
+  pane.append(
+    h('div', { class: 'pane-toolbar' },
+      h('span', { class: 'pane-label', text: 'Playlist' }), els.count, h('div', { class: 'spacer' }),
+      h('button', { class: 'tb-btn', title: 'Add music files', onclick: addAudioDialog }, icon('plus'), h('span', { text: 'Add music…' }))),
+    h('div', { class: 'pane-body', dataset: { drop: 'Drop music here' } }, els.listScroll, els.playlistEmpty));
+
+  els.list.addEventListener('click', (e) => {
+    const row = e.target.closest('.track');
+    if (row) select(row.dataset.id);
+  });
+  els.list.addEventListener('dblclick', (e) => {
+    const row = e.target.closest('.track');
+    if (row && !e.target.closest('button')) playTrack(row.dataset.id);
+  });
+  els.list.addEventListener('dragstart', (e) => {
+    const row = e.target.closest('.track');
+    if (!row) return;
+    e.dataTransfer.setData(TRACK_DRAG, row.dataset.id);
+    e.dataTransfer.effectAllowed = 'move';
+    row.classList.add('dragging');
+  });
+  els.list.addEventListener('dragend', () => {
+    els.list.querySelectorAll('.dragging').forEach((r) => r.classList.remove('dragging'));
+    els.dropLine.classList.add('hidden');
+  });
+
+  // Dropping onto the playlist: reorder songs, or add music files at that spot.
+  pane.addEventListener('dragover', (e) => {
+    const types = [...e.dataTransfer.types];
+    const internal = types.includes(TRACK_DRAG);
+    if (!internal && !types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = internal ? 'move' : 'copy';
+    document.body.classList.add('drop-on-playlist');
+    if (!tracks().length) return;
+    const { y } = dropIndexAt(e.clientY);
+    const sr = els.listScroll.getBoundingClientRect();
+    els.dropLine.style.top = `${y - sr.top + els.listScroll.scrollTop - 1}px`;
+    els.dropLine.classList.remove('hidden');
+  });
+  pane.addEventListener('dragleave', (e) => {
+    if (!pane.contains(e.relatedTarget)) { els.dropLine.classList.add('hidden'); document.body.classList.remove('drop-on-playlist'); }
+  });
+  pane.addEventListener('drop', async (e) => {
+    const types = [...e.dataTransfer.types];
+    if (!types.includes(TRACK_DRAG) && !types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    endFileDrag();
+    const { index } = dropIndexAt(e.clientY);
+    if (types.includes(TRACK_DRAG)) moveTrack(e.dataTransfer.getData(TRACK_DRAG), index);
+    else await handleDroppedFiles(e.dataTransfer.files, index);
+  });
+}
+
+function dropIndexAt(clientY) {
+  const rows = [...els.list.children];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i].getBoundingClientRect();
+    if (clientY < r.top + r.height / 2) return { index: i, y: r.top };
+  }
+  const last = rows[rows.length - 1];
+  return { index: rows.length, y: last ? last.getBoundingClientRect().bottom : 0 };
+}
+
+/** Scripts go to the script pane, music goes to the playlist. */
+async function handleDroppedFiles(files, index = null) {
+  const paths = [...files].map((f) => api.pathForFile(f)).filter(Boolean);
+  const scripts = paths.filter(isScriptPath);
+  const audio = paths.filter(isAudioPath);
+  const other = paths.filter((p) => !isScriptPath(p) && !isAudioPath(p));
+  if (scripts.length) await importScript(scripts[0]);
+  if (audio.length) await addAudio(audio, index);
+  if (other.length) toast(`Skipped ${other.length === 1 ? `“${basename(other[0])}”` : `${other.length} files`}: not music or a script.`, 'warn');
+}
+
+function endFileDrag() {
+  document.body.classList.remove('drag-files', 'drop-on-playlist');
+  if (els.dropLine) els.dropLine.classList.add('hidden');
+}
+
+function wireDrops() {
+  const screen = $('#showScreen');
+  screen.addEventListener('dragover', (e) => {
+    if (![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    document.body.classList.add('drag-files');
+  });
+  screen.addEventListener('drop', async (e) => {
+    if (![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    endFileDrag();
+    await handleDroppedFiles(e.dataTransfer.files);
+  });
+  document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) endFileDrag(); });
+  document.addEventListener('dragend', endFileDrag);
+  // Files dropped anywhere else must never navigate the window away.
+  window.addEventListener('dragover', (e) => { if (!e.defaultPrevented) { e.preventDefault(); e.dataTransfer.dropEffect = 'none'; } });
+  window.addEventListener('drop', (e) => { e.preventDefault(); endFileDrag(); });
+}
+
+async function importScript(path) {
+  try {
+    const info = await api.importScript(path);
+    state.show.script = info;
+    changed();
+    await scriptView.load(info);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function pickScript() {
+  const p = await api.pickScript().catch(() => null);
+  if (p) await importScript(p);
+}
+
+// ------------------------------------------------------------------ shows
 
 function showScreen(which) {
   $('#home').classList.toggle('hidden', which !== 'home');
   $('#showScreen').classList.toggle('hidden', which !== 'show');
 }
 
-async function openShow({ dir, show }, { standbyId = null, mode = null } = {}) {
-  if (store.show) {
-    player.silence();
-    await store.flush().catch(() => {});
+/** Older shows stored a cue list; keep their sound files as playlist songs. */
+function normalize(show) {
+  if (!Array.isArray(show.tracks)) {
+    show.tracks = (show.cues || [])
+      .filter((c) => c && c.type === 'audio' && c.file)
+      .map((c) => ({ id: c.id || uid('t'), file: c.file, name: c.name || basename(c.file) }));
   }
-  player.cancelPreload();
-  engine.clear();
-  player.active.clear();
-  player.showClockStart = null;
-  player.standbyId = null;
-  if (mode === 'show' || mode === 'edit') show.settings = { ...(show.settings || {}), mode };
-  store.load(dir, show);
-  showScreen('show');
-  applyMode();
+  const seen = new Set();
+  for (const t of show.tracks) {
+    if (!t.id || seen.has(t.id)) t.id = uid('t');
+    seen.add(t.id);
+  }
+  if (typeof show.volume !== 'number') show.volume = 1;
+  show.version = 2;
+  return show;
+}
+
+async function openShow({ dir, show }) {
+  if (state.show) { player.unload(); await flushSave(); }
+  player.unload();
+  state.dir = dir;
+  state.show = normalize(show);
+  state.selectedId = show.tracks[0]?.id || null;
+  state.durations.clear();
+  state.missing.clear();
+  state.lastRemoved = null;
+  state.muted = false;
+  clearToasts();
+  els.showName.textContent = show.name;
   api.setTitle(`${show.name} — Cuebook`);
-  api.setShowMode(!store.editing).catch(() => {});
-  engine.setMasterDb(Number(show.settings.masterDb) || 0);
-  transport.refreshDevices();
-  player.setStandby(standbyId && store.cue(standbyId) ? standbyId : store.cues[0]?.id || null, { scroll: false });
-  renderAll();
+  showScreen('show');
+  applyVolume();
+  renderPlaylist();
   if (show.__restoredFromBackup) {
     delete show.__restoredFromBackup;
-    toast('The show file was damaged, so the last good backup was opened instead.', 'warn', 10000);
+    toast('The show file was damaged, so the last good backup was opened instead.', 'warn', { ms: 10000 });
   }
-  await scriptView.load(show.script, { force: true });
-  const missing = await player.checkFiles().catch(() => []);
-  if (missing.length) toast(`${missing.length} sound file${missing.length === 1 ? ' is' : 's are'} missing from the show folder. Those cues are marked in red.`, 'error', 12000);
-  player.preloadAll();
+  scriptView.load(show.script);
+  const files = [...new Set(tracks().map((t) => t.file))];
+  if (files.length) {
+    try {
+      const found = await api.checkFiles(files);
+      for (const f of files) if (!found[f]) state.missing.add(f);
+    } catch { /* leave as is */ }
+    updateRows();
+    if (state.missing.size) toast(`${state.missing.size} music file${state.missing.size === 1 ? ' is' : 's are'} missing from the show folder. They're marked in red.`, 'error', { ms: 12000 });
+  }
+  loadDurations();
 }
 
-function applyMode() {
-  const editing = store.editing;
-  document.body.classList.toggle('mode-show', !editing);
-  document.body.classList.toggle('mode-edit', editing);
+async function closeShow() {
+  if (!state.show) return;
+  if (player.playing && !(await confirmDialog('Close the show?', 'The music will stop.', { ok: 'Stop and close', danger: true }))) return;
+  player.unload();
+  await flushSave();
+  await api.closeShow().catch(() => {});
+  state.show = null;
+  state.dir = null;
+  durationToken++;
+  await scriptView.load(null);
+  clearToasts();
+  api.setTitle('Cuebook');
+  showScreen('home');
+  home.render();
 }
 
-function renderAll() {
-  if (!store.show) return;
-  applyMode();
-  transport.renderTopbar();
-  transport.renderStandby();
-  transport.renderActive();
-  cueList.render();
-  scriptView.applyView();
-  scriptView.renderMarkers();
-  if (!store.show.script) scriptView.renderEmpty();
-  inspector.render();
-}
-
-// ---------------------------------------------------------------- event routing
-
-function wireEvents() {
-  store.subscribe((what) => {
-    if (!store.show) return;
-    if (what.all) return; // openShow renders everything itself
-    if (what.locked) toast('The show is locked in Show mode. Switch to Edit to make changes.', 'warn');
-    if (what.save) transport.renderSave();
-    if (what.mode) {
-      applyMode();
-      transport.renderTopbar();
-      cueList.render();
-      inspector.render();
-      scriptView.renderMarkers();
-      if (!store.show.script) scriptView.renderEmpty();
-    }
-    if (what.cues) {
-      cueList.render();
-      scriptView.renderMarkers();
-      if (inspector._selfEdit) inspector.refreshSoft(); else inspector.render();
-      transport.renderStandby();
-      if (player.standbyId && !store.cue(player.standbyId)) player.setStandby(null, { scroll: false });
-      player.preloadAround();
-    }
-    if (what.script) scriptView.load(store.show.script); // no-op if already showing it
-    if (what.selection) {
-      cueList.updateStates();
-      scriptView.updateMarkerStates();
-      inspector.render();
-    }
-    if (what.settings || what.view || what.name) {
-      transport.renderTopbar();
-      scriptView.applyView();
-    }
-    if (what.name) api.setTitle(`${store.show.name} — Cuebook`);
-  });
-
-  player.subscribe((what) => {
-    if (!store.show) return;
-    if (what.standby) {
-      cueList.updateStates();
-      scriptView.updateMarkerStates();
-      transport.renderStandby();
-      if (what.scroll) {
-        cueList.scrollToStandby();
-        if (store.show.settings.followScript) scriptView.scrollToCue(player.standbyId);
-      }
-    }
-    if (what.active) {
-      transport.renderActive();
-      scriptView.updateMarkerStates();
-    }
-    if (what.error) toast(what.error, 'error');
-    if (what.guarded) transport.flashGuard();
-    if (what.go) transport.flashGo();
-    if (what.load) {
-      cueList.updateLoadStates();
-      transport.renderStandby();
-      inspector.onFileLoaded();
-    }
+function showShortcuts() {
+  const rows = [
+    ['Space', 'Play / pause'],
+    ['Esc', 'Stop (back to the start of the song)'],
+    ['← / →', 'Jump back / forward 5 seconds'],
+    ['↑ / ↓', 'Select the previous / next song'],
+    ['Enter', 'Play the selected song'],
+    ['Delete', 'Remove the selected song from the playlist'],
+  ];
+  modal({
+    title: 'Keyboard shortcuts',
+    body: h('table', { class: 'shortcuts' }, rows.map(([k, d]) => h('tr', {}, h('td', {}, h('kbd', { text: k })), h('td', { text: d })))),
+    buttons: [{ label: 'Close', value: true, primary: true }],
   });
 }
 
-function isTypingTarget(el) {
-  if (!el || el === document.body) return false;
-  if (el.isContentEditable) return true;
-  if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
-  if (el.tagName === 'INPUT') return !['range', 'checkbox', 'radio', 'button'].includes(el.type);
-  return false;
+// ------------------------------------------------------------------ keyboard
+
+function isTyping(el) {
+  if (!el) return false;
+  if (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
+  return el.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type);
 }
 
 function wireKeyboard() {
   window.addEventListener('keydown', (e) => {
-    const typing = isTypingTarget(e.target);
     if (isModalOpen()) {
       if (e.key === 'Escape') { e.preventDefault(); closeModal(null); }
       return;
     }
-    if (!store.show) return;
-
-    if (e.code === 'Space' && !typing) {
-      e.preventDefault();
-      if (!e.repeat) actions.go();
-      return;
-    }
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      if (scriptView.cancelPinMode()) return;
-      if (typing) { e.target.blur(); return; }
-      player.stopAll();
-      return;
-    }
-    if (typing) return;
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      e.preventDefault();
-      player.moveStandby(e.key === 'ArrowDown' ? 1 : -1);
-      return;
-    }
-    if (!store.editing) return;
+    if (!state.show || isTyping(e.target)) return;
     const ctrl = e.ctrlKey || e.metaKey;
-    if (ctrl && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); if (!store.undo()) toast('Nothing to undo.', 'info', 1500); return; }
-    if (ctrl && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) { e.preventDefault(); if (!store.redo()) toast('Nothing to redo.', 'info', 1500); return; }
-    if ((e.key === 'Delete' || e.key === 'Backspace') && store.selectedId) { e.preventDefault(); actions.deleteCue(store.selectedId); }
+    switch (e.key) {
+      case ' ':
+        e.preventDefault();
+        if (!e.repeat) togglePlay();
+        break;
+      case 'Escape': e.preventDefault(); player.stop(); break;
+      case 'ArrowLeft': e.preventDefault(); player.seek(player.time - 5); break;
+      case 'ArrowRight': e.preventDefault(); player.seek(player.time + 5); break;
+      case 'ArrowUp': e.preventDefault(); moveSelection(-1); break;
+      case 'ArrowDown': e.preventDefault(); moveSelection(1); break;
+      case 'Enter': if (state.selectedId) { e.preventDefault(); playTrack(state.selectedId); } break;
+      case 'Delete':
+      case 'Backspace': if (state.selectedId) { e.preventDefault(); removeTrack(state.selectedId); } break;
+      default:
+        if (ctrl && e.key.toLowerCase() === 'z' && state.lastRemoved) { e.preventDefault(); undoRemove(); }
+    }
   }, true);
-
-  // A focused button would otherwise be "clicked" by the Space bar on keyup.
-  window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space' && !isTypingTarget(e.target)) e.preventDefault();
-  }, true);
-
-  // Don't let buttons keep keyboard focus after a mouse click.
+  // A focused button would otherwise be "clicked" by Space on key-up.
+  window.addEventListener('keyup', (e) => { if (e.key === ' ' && !isTyping(e.target) && !isModalOpen()) e.preventDefault(); }, true);
+  // Buttons shouldn't keep keyboard focus after a mouse click.
   document.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (b && e.detail > 0) b.blur();
   });
-
-  const updateTyping = () => transport.setTyping(!!store.show && isTypingTarget(document.activeElement));
-  document.addEventListener('focusin', updateTyping);
-  document.addEventListener('focusout', () => setTimeout(updateTyping, 0));
-
-  // Files dropped outside a drop zone must never navigate the window away.
-  window.addEventListener('dragover', (e) => { if (!e.defaultPrevented) { e.preventDefault(); e.dataTransfer.dropEffect = 'none'; } });
-  window.addEventListener('drop', (e) => e.preventDefault());
 }
 
-function wireSplitters() {
+function wireSplitter() {
   const ws = $('#workspace');
-  const load = (k, d) => { try { return Number(localStorage.getItem(k)) || d; } catch { return d; } };
-  const save = (k, v) => { try { localStorage.setItem(k, String(v)); } catch { /* ignore */ } };
-  ws.style.setProperty('--script-w', `${load('cuebook.scriptW', 56)}%`);
-  $('#cuePane').style.setProperty('--insp-h', `${load('cuebook.inspH', 44)}%`);
-
-  const drag = (handle, onMove, onEnd) => {
-    handle.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      handle.setPointerCapture(e.pointerId);
-      handle.classList.add('active');
-      const move = (ev) => onMove(ev);
-      const up = () => {
-        handle.classList.remove('active');
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', up);
-        onEnd();
-      };
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', up);
-    });
-  };
-  let sw = load('cuebook.scriptW', 56);
-  drag($('#splitV'), (ev) => {
-    const r = ws.getBoundingClientRect();
-    sw = Math.min(75, Math.max(25, ((ev.clientX - r.left) / r.width) * 100));
-    ws.style.setProperty('--script-w', `${sw}%`);
-  }, () => save('cuebook.scriptW', sw.toFixed(1)));
-  let ih = load('cuebook.inspH', 44);
-  drag($('#splitH'), (ev) => {
-    const r = $('#cuePane').getBoundingClientRect();
-    ih = Math.min(80, Math.max(20, ((r.bottom - ev.clientY) / r.height) * 100));
-    $('#cuePane').style.setProperty('--insp-h', `${ih}%`);
-  }, () => save('cuebook.inspH', ih.toFixed(1)));
+  let w = 55;
+  try { w = Number(localStorage.getItem('cuebook.scriptW')) || 55; } catch { /* default */ }
+  ws.style.setProperty('--script-w', `${w}%`);
+  const handle = $('#splitter');
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('active');
+    const move = (ev) => {
+      const r = ws.getBoundingClientRect();
+      w = clamp(((ev.clientX - r.left) / r.width) * 100, 25, 75);
+      ws.style.setProperty('--script-w', `${w}%`);
+    };
+    const up = () => {
+      handle.classList.remove('active');
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      try { localStorage.setItem('cuebook.scriptW', w.toFixed(1)); } catch { /* ignore */ }
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
 }
 
-function frame() {
-  if (store.show) {
-    transport.updateLive();
-    cueList.updateLive();
-    inspector.updateLive();
-  }
-  requestAnimationFrame(frame);
-}
-
-// ---------------------------------------------------------------- boot
+// ------------------------------------------------------------------ boot
 
 async function boot() {
-  scriptView = new ScriptView($('#scriptPane'), { player, actions, toast });
-  cueList = new CueList($('#cueListPane'), { player, engine, actions, scriptView, toast });
-  inspector = new Inspector($('#inspector'), { player, engine, actions, scriptView });
-  // Pin positions only make sense once a script is laid out: refresh what depends on them.
-  scriptView.onLoaded = () => {
-    if (!store.show) return;
-    cueList.render();
-    inspector.refreshSoft();
-  };
-  transport = new Transport({ topbar: $('#topbar'), transport: $('#transport') }, { player, engine, actions, toast });
+  els.showName = h('div', { class: 'show-name' });
+  $('#topbar').append(
+    h('div', { class: 'brand' }, h('span', { class: 'brand-mark' }), h('span', { text: 'Cuebook' })),
+    els.showName,
+    h('div', { class: 'spacer' }),
+    h('button', { class: 'tb-btn', title: 'Open the show folder in Explorer', onclick: () => api.reveal().catch(() => {}) }, icon('folder'), h('span', { text: 'Show folder' })),
+    h('button', { class: 'tb-btn', title: 'Close this show', onclick: closeShow }, icon('close'), h('span', { text: 'Close show' })));
+
+  scriptView = new ScriptView($('#scriptPane'), { onPick: pickScript, mediaUrl });
+  buildPlaylistPane();
+  buildPlayerBar();
   home = new Home($('#home'), { onOpen: openShow, toast });
 
-  wireEvents();
+  player.onChange = refreshPlayerState;
+  player.onEnded = onTrackEnded;
+  player.onError = onPlayError;
+
   wireKeyboard();
-  wireSplitters();
+  wireDrops();
+  wireSplitter();
   requestAnimationFrame(frame);
 
   api.onMenu((cmd) => {
-    if (cmd === 'reveal' && store.show) api.reveal().catch(() => {});
-    if (cmd === 'close-show') actions.closeShow();
-    if (cmd === 'shortcuts') actions.showShortcuts();
+    if (cmd === 'reveal' && state.show) api.reveal().catch(() => {});
+    if (cmd === 'close-show') closeShow();
+    if (cmd === 'shortcuts') showShortcuts();
   });
-
   api.onBeforeClose(async () => {
-    try { await store.flush(); } catch { /* reported in UI */ }
-    const playing = player.playing;
-    const locked = !!store.show && !store.editing;
-    api.closeReply({
-      needsConfirm: playing || locked || store.saveState === 'error',
-      reason: store.saveState === 'error' ? 'The latest changes could not be saved. Quit anyway?'
-        : playing ? 'Sound is still playing. Quit anyway?'
-          : 'The show is in Show mode. Quit Cuebook?',
-    });
+    try { await flushSave(); } catch { /* reported already */ }
+    api.closeReply({ needsConfirm: player.playing, reason: 'Music is still playing. Quit anyway?' });
   });
 
   // Reopen the show after a crash, or a .cuebook file passed on the command line.
-  const rec = await api.getRecovery().catch(() => null);
-  if (rec && rec.showDir) {
+  const pending = await api.takePendingOpen().catch(() => null);
+  if (pending && pending.dir) {
     try {
-      await openShow(await api.openShow(rec.showDir), { standbyId: rec.standbyId, mode: rec.mode });
-      if (rec.reason && rec.reason !== 'open-file') {
-        const c = player.standby;
-        toast(`Cuebook restarted after a problem and reopened your show.${c ? ` Next cue: Q${c.number} ${c.name}.` : ''}`, 'warn', 15000);
-      }
+      await openShow(await api.openShow(pending.dir));
+      if (pending.reason === 'crash') toast('Cuebook restarted after a problem and reopened your show.', 'warn', { ms: 12000 });
       return;
     } catch (err) {
       toast(err.message, 'error');
@@ -632,7 +734,11 @@ async function boot() {
   await home.render();
 }
 
-// Exposed for automated testing and debugging from DevTools.
-window.__cuebook = { store, player, engine, actions, openShow, get scriptView() { return scriptView; } };
+// For automated tests and debugging from DevTools.
+window.__cuebook = {
+  state, player, openShow, closeShow,
+  actions: { playTrack, togglePlay, step, prev, addAudio, importScript, removeTrack, undoRemove, moveTrack },
+  get scriptView() { return scriptView; },
+};
 
 boot();

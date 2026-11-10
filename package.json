@@ -1,8 +1,8 @@
 {
   "name": "cuebook",
   "productName": "Cuebook",
-  "version": "0.1.0",
-  "description": "Sound cue playback for theater: script on the left, cue list on the right, one big GO button.",
+  "version": "0.2.0",
+  "description": "A simple show media player: script on the left, playlist on the right.",
   "main": "main.js",
   "private": true,
   "scripts": {
@@ -25,6 +25,9 @@
         "description": "Cuebook show file"
       }
     ],
+    "directories": {
+      "output": "release"
+    },
     "win": {
       "target": [
         "nsis",
